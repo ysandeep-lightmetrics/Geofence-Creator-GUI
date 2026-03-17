@@ -1,0 +1,75 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: GeofenceCreator.exe
+            build_path: dist/GeofenceCreator.exe
+          - os: macos-latest
+            artifact: GeofenceCreator-mac
+            build_path: dist/GeofenceCreator
+          - os: ubuntu-latest
+            artifact: GeofenceCreator-linux
+            build_path: dist/GeofenceCreator
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller requests
+
+      - name: Build with PyInstaller
+        env:
+          LMPRESALES_PWD: ${{ secrets.LMPRESALES_PWD }}
+          LMQATESTING1_PWD: ${{ secrets.LMQATESTING1_PWD }}
+          LMQATESTING2_PWD: ${{ secrets.LMQATESTING2_PWD }}
+        run: pyinstaller --onefile --windowed --name GeofenceCreator geofence_creator_gui.py
+
+      - name: Rename artifact (non-Windows)
+        if: matrix.os != 'windows-latest'
+        run: mv "${{ matrix.build_path }}" "dist/${{ matrix.artifact }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/GeofenceCreator.exe/GeofenceCreator.exe
+            artifacts/GeofenceCreator-mac/GeofenceCreator-mac
+            artifacts/GeofenceCreator-linux/GeofenceCreator-linux
