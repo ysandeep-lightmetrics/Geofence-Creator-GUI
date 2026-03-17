@@ -9,6 +9,7 @@ import tempfile
 import os
 from dotenv import load_dotenv
 import requests
+from datetime import datetime
 from requests.auth import HTTPBasicAuth
 
 
@@ -16,6 +17,9 @@ from requests.auth import HTTPBasicAuth
 # Scrollable frame helper
 # ---------------------------------------------------------------------------
 class ScrollableFrame(ttk.Frame):
+    _instances = []
+    _global_bound = False
+
     def __init__(self, container, *args, **kwargs):
         super().__init__(container, *args, **kwargs)
         self.canvas = tk.Canvas(self, highlightthickness=0)
@@ -35,13 +39,28 @@ class ScrollableFrame(ttk.Frame):
         # Make inner frame stretch to canvas width
         self.canvas.bind("<Configure>", self._on_canvas_resize)
 
-        # Mousewheel: check if cursor is over this scrollable area
-        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        # Mousewheel: single global binding shared by all instances
+        ScrollableFrame._instances.append(self)
+        if not ScrollableFrame._global_bound:
+            self.winfo_toplevel().bind_all("<MouseWheel>", ScrollableFrame._global_mousewheel)
+            ScrollableFrame._global_bound = True
+        self.bind("<Destroy>", self._on_destroy)
+
+    def _on_destroy(self, event):
+        if event.widget is self and self in ScrollableFrame._instances:
+            ScrollableFrame._instances.remove(self)
 
     def _on_canvas_resize(self, event):
         self.canvas.itemconfigure(self._win_id, width=event.width)
 
-    def _on_mousewheel(self, event):
+    @staticmethod
+    def _global_mousewheel(event):
+        for inst in ScrollableFrame._instances:
+            if not inst.winfo_exists():
+                continue
+            inst._handle_mousewheel(event)
+
+    def _handle_mousewheel(self, event):
         # Only scroll if the mouse is over this widget or its children
         widget = event.widget
         try:
@@ -281,7 +300,8 @@ class GeofenceCreatorGUI:
         btn = ttk.Frame(right_frame)
         btn.pack(fill=tk.X, padx=5, pady=5)
         ttk.Button(btn, text="Preview JSON", command=self._preview_property).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn, text="Create Property", command=self._create_property).pack(side=tk.LEFT, padx=5)
+        self.create_prop_btn = ttk.Button(btn, text="Create Property", command=self._create_property)
+        self.create_prop_btn.pack(side=tk.LEFT, padx=5)
 
         ttk.Label(right_frame, text="JSON Preview:", font=("Segoe UI", 9, "bold")).pack(
             anchor="w", padx=8, pady=(5, 0)
@@ -540,6 +560,28 @@ class GeofenceCreatorGUI:
         ttk.Label(faraway, text="  Distance (km):").pack(side=tk.LEFT)
         ttk.Entry(faraway, textvariable=self.faraway_dist, width=8).pack(side=tk.LEFT, padx=5)
 
+    # ---- Helpers ----
+    @staticmethod
+    def _safe_int(value, default=0):
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            return default
+
+    def _treeview_sort(self, tree, col, reverse):
+        data = [(tree.set(k, col), k) for k in tree.get_children("")]
+        try:
+            data.sort(key=lambda t: float(t[0]), reverse=reverse)
+        except ValueError:
+            data.sort(key=lambda t: t[0].lower(), reverse=reverse)
+        for idx, (_, k) in enumerate(data):
+            tree.move(k, "", idx)
+        tree.heading(col, command=lambda: self._treeview_sort(tree, col, not reverse))
+
+    def _make_sortable(self, tree, columns):
+        for col in columns:
+            tree.heading(col, command=lambda c=col: self._treeview_sort(tree, c, False))
+
     # ---- Build property payload ----
     def _build_property_payload(self):
         payload = {}
@@ -580,7 +622,7 @@ class GeofenceCreatorGUI:
                     "mediaType": [
                         {
                             "collage": self.media_collage.get(),
-                            "quality": int(self.media_quality.get() or 10),
+                            "quality": self._safe_int(self.media_quality.get(), 10),
                             "sources": sources or ["DRIVER"],
                             "resolution": self.media_resolution.get(),
                         }
@@ -626,8 +668,8 @@ class GeofenceCreatorGUI:
                         "stopSignEnabled": self.cfg_stop_sign.get(),
                         "tailgatingEnabled": self.cfg_tailgating.get(),
                         "trafficLightEnabled": self.cfg_traffic_light.get(),
-                        "idlingDurationInMinute": int(self.cfg_idle_dur.get() or 5),
-                        "speedUpperLimit": int(self.cfg_speed_limit.get() or 60),
+                        "idlingDurationInMinute": self._safe_int(self.cfg_idle_dur.get(), 5),
+                        "speedUpperLimit": self._safe_int(self.cfg_speed_limit.get(), 60),
                     },
                 }
             )
@@ -653,7 +695,7 @@ class GeofenceCreatorGUI:
             rule = {"action": self.faraway_action.get(), "target": "FAR_AWAY_ASSET"}
             dist = self.faraway_dist.get().strip()
             if dist:
-                rule["farAwayDistanceInKm"] = int(dist)
+                rule["farAwayDistanceInKm"] = self._safe_int(dist, 4)
             rules.append(rule)
 
         if rules:
@@ -678,19 +720,27 @@ class GeofenceCreatorGUI:
 
         self.prop_resp.delete("1.0", tk.END)
         self.prop_resp.insert(tk.END, f"POST {url}\n\n")
+        self.create_prop_btn.configure(state="disabled")
 
-        try:
-            resp = requests.post(url, headers=headers, auth=auth, json=payload, timeout=30)
+
+        def worker():
             try:
-                result = resp.json()
-            except Exception:
-                result = resp.text
+                resp = requests.post(url, headers=headers, auth=auth, json=payload, timeout=30)
+                try:
+                    result = resp.json()
+                except Exception:
+                    result = resp.text
+                self.root.after(0, lambda: on_done(resp, result))
+            except Exception as e:
+                self.root.after(0, lambda: on_error(e))
 
+        def on_done(resp, result):
+
+            self.create_prop_btn.configure(state="normal")
             self.prop_resp.insert(
                 tk.END,
                 f"Status: {resp.status_code}\n\n{json.dumps(result, indent=2) if isinstance(result, dict) else result}\n",
             )
-
             if isinstance(result, dict) and "propertyId" in result:
                 pid = result["propertyId"]
                 self.stored_property_id.set(str(pid))
@@ -698,8 +748,13 @@ class GeofenceCreatorGUI:
                     tk.END,
                     f"\n--- Property ID {pid} saved! Auto-filled in Geofence tab. ---",
                 )
-        except Exception as e:
+
+        def on_error(e):
+
+            self.create_prop_btn.configure(state="normal")
             self.prop_resp.insert(tk.END, f"ERROR: {e}")
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # ================================================================
     # GEOFENCE TAB
@@ -753,7 +808,8 @@ class GeofenceCreatorGUI:
         btn = ttk.Frame(right_frame)
         btn.pack(fill=tk.X, padx=5, pady=5)
         ttk.Button(btn, text="Preview JSON", command=self._preview_geofence).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn, text="Create Geofence", command=self._create_geofence).pack(side=tk.LEFT, padx=5)
+        self.create_geo_btn = ttk.Button(btn, text="Create Geofence", command=self._create_geofence)
+        self.create_geo_btn.pack(side=tk.LEFT, padx=5)
 
         ttk.Label(right_frame, text="JSON Preview / Response:", font=("Segoe UI", 9, "bold")).pack(
             anchor="w", padx=8, pady=(5, 0)
@@ -810,7 +866,7 @@ class GeofenceCreatorGUI:
             return None
 
         return {
-            "propertyId": int(pid),
+            "propertyId": self._safe_int(pid, 0),
             "geofences": [
                 {
                     "geofenceName": name,
@@ -838,20 +894,34 @@ class GeofenceCreatorGUI:
 
         self.geo_resp.delete("1.0", tk.END)
         self.geo_resp.insert(tk.END, f"POST {url}\n\n")
+        self.create_geo_btn.configure(state="disabled")
 
-        try:
-            resp = requests.post(url, headers=headers, auth=auth, json=payload, timeout=30)
+
+        def worker():
             try:
-                result = resp.json()
-            except Exception:
-                result = resp.text
+                resp = requests.post(url, headers=headers, auth=auth, json=payload, timeout=30)
+                try:
+                    result = resp.json()
+                except Exception:
+                    result = resp.text
+                self.root.after(0, lambda: on_done(resp, result))
+            except Exception as e:
+                self.root.after(0, lambda: on_error(e))
 
+        def on_done(resp, result):
+
+            self.create_geo_btn.configure(state="normal")
             self.geo_resp.insert(
                 tk.END,
                 f"Status: {resp.status_code}\n\n{json.dumps(result, indent=2) if isinstance(result, dict) else result}",
             )
-        except Exception as e:
+
+        def on_error(e):
+
+            self.create_geo_btn.configure(state="normal")
             self.geo_resp.insert(tk.END, f"ERROR: {e}")
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # ================================================================
     # PREVIEW PROPERTIES TAB
@@ -860,9 +930,8 @@ class GeofenceCreatorGUI:
         top = ttk.LabelFrame(parent, text="Fleet Geofence Properties", padding=10)
         top.pack(fill=tk.X, padx=10, pady=5)
 
-        ttk.Button(top, text="Fetch Properties", command=self._fetch_properties).grid(
-            row=0, column=0, pady=3, sticky="w"
-        )
+        self.fetch_props_btn = ttk.Button(top, text="Fetch Properties", command=self._fetch_properties)
+        self.fetch_props_btn.grid(row=0, column=0, pady=3, sticky="w")
         ttk.Button(top, text="Delete Selected", command=self._delete_selected_property).grid(
             row=0, column=1, pady=3, sticky="w", padx=(15, 0)
         )
@@ -904,6 +973,7 @@ class GeofenceCreatorGUI:
         for col in columns:
             self.props_tree.heading(col, text=col_labels.get(col, col))
             self.props_tree.column(col, width=col_widths.get(col, 100), minwidth=50)
+        self._make_sortable(self.props_tree, columns)
 
         vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.props_tree.yview)
         hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.props_tree.xview)
@@ -937,6 +1007,28 @@ class GeofenceCreatorGUI:
         self.props_raw = scrolledtext.ScrolledText(raw_frame, height=8, font=("Consolas", 9))
         self.props_raw.pack(fill=tk.BOTH, expand=True)
 
+    @staticmethod
+    def _summarize_rules(rules_list):
+        summary = []
+        for r in rules_list:
+            action = r.get("action", "")
+            target = r.get("target", "")
+            applies = r.get("appliesTo", [])
+            extra = ""
+            if applies:
+                extra = f" ({','.join(applies)})"
+            if r.get("farAwayDistanceInKm"):
+                extra = f" ({r['farAwayDistanceInKm']}km)"
+            if r.get("fileType"):
+                extra = f" ({r['fileType']})"
+            if r.get("assetConfiguration"):
+                cfg = r["assetConfiguration"]
+                blur = cfg.get("blurConfig", {})
+                if blur:
+                    extra = f" (blur:{blur.get('driverBlurMode', '')})"
+            summary.append(f"{action} {target}{extra}")
+        return " | ".join(summary)
+
     def _fetch_properties(self):
         base = self.base_url.get().rstrip("/")
         fleet = self.fleet_id.get()
@@ -947,13 +1039,23 @@ class GeofenceCreatorGUI:
             self.props_tree.delete(item)
         self.props_raw.delete("1.0", tk.END)
         self.props_count_label.set("Fetching...")
+        self.fetch_props_btn.configure(state="disabled")
 
-        try:
-            resp = requests.get(url, auth=auth, timeout=30)
+
+        def worker():
             try:
-                result = resp.json()
-            except Exception:
-                result = resp.text
+                resp = requests.get(url, auth=auth, timeout=30)
+                try:
+                    result = resp.json()
+                except Exception:
+                    result = resp.text
+                self.root.after(0, lambda: on_done(resp, result))
+            except Exception as e:
+                self.root.after(0, lambda: on_error(e))
+
+        def on_done(resp, result):
+
+            self.fetch_props_btn.configure(state="normal")
 
             self.props_raw.insert(
                 tk.END,
@@ -971,25 +1073,6 @@ class GeofenceCreatorGUI:
             self.props_count_label.set(f"{len(rows)} properties  |  Total: {total_count}  |  Status: {resp.status_code}")
 
             for prop in rows:
-                rules_summary = []
-                for r in prop.get("geofenceRules", []):
-                    action = r.get("action", "")
-                    target = r.get("target", "")
-                    applies = r.get("appliesTo", [])
-                    extra = ""
-                    if applies:
-                        extra = f" ({','.join(applies)})"
-                    if r.get("farAwayDistanceInKm"):
-                        extra = f" ({r['farAwayDistanceInKm']}km)"
-                    if r.get("fileType"):
-                        extra = f" ({r['fileType']})"
-                    if r.get("assetConfiguration"):
-                        cfg = r["assetConfiguration"]
-                        blur = cfg.get("blurConfig", {})
-                        if blur:
-                            extra = f" (blur:{blur.get('driverBlurMode', '')})"
-                    rules_summary.append(f"{action} {target}{extra}")
-
                 gf_ids = prop.get("geofenceIds", [])
                 self.props_tree.insert(
                     "",
@@ -1000,14 +1083,18 @@ class GeofenceCreatorGUI:
                         prop.get("description", ""),
                         prop.get("colourHex", ""),
                         len(gf_ids),
-                        " | ".join(rules_summary),
+                        self._summarize_rules(prop.get("geofenceRules", [])),
                         "Yes" if prop.get("isDefaultProperty") else "No",
                     ),
                 )
 
-        except Exception as e:
+        def on_error(e):
+
+            self.fetch_props_btn.configure(state="normal")
             self.props_count_label.set("Error!")
             self.props_raw.insert(tk.END, f"ERROR: {e}")
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _props_tree_right_click(self, event):
         item = self.props_tree.identify_row(event.y)
@@ -1092,9 +1179,8 @@ class GeofenceCreatorGUI:
             state="readonly",
         ).grid(row=0, column=5, padx=5, pady=3, sticky="w")
 
-        ttk.Button(top, text="Fetch Geofences", command=self._fetch_device_geofences).grid(
-            row=1, column=0, columnspan=2, pady=(8, 0), sticky="w"
-        )
+        self.fetch_preview_btn = ttk.Button(top, text="Fetch Geofences", command=self._fetch_device_geofences)
+        self.fetch_preview_btn.grid(row=1, column=0, columnspan=2, pady=(8, 0), sticky="w")
         ttk.Button(top, text="Delete Selected", command=self._delete_selected_geofence).grid(
             row=1, column=2, pady=(8, 0), sticky="w", padx=(15, 0)
         )
@@ -1126,6 +1212,7 @@ class GeofenceCreatorGUI:
         for col in columns:
             self.preview_tree.heading(col, text=col)
             self.preview_tree.column(col, width=col_widths.get(col, 100), minwidth=50)
+        self._make_sortable(self.preview_tree, columns)
 
         vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.preview_tree.yview)
         hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.preview_tree.xview)
@@ -1186,15 +1273,24 @@ class GeofenceCreatorGUI:
             self.preview_tree.delete(item)
         self.preview_raw.delete("1.0", tk.END)
         self.preview_count_label.set("Fetching...")
+        self.fetch_preview_btn.configure(state="disabled")
 
-        try:
-            resp = requests.get(url, params=params, auth=auth, timeout=30)
+
+        def worker():
             try:
-                result = resp.json()
-            except Exception:
-                result = resp.text
+                resp = requests.get(url, params=params, auth=auth, timeout=30)
+                try:
+                    result = resp.json()
+                except Exception:
+                    result = resp.text
+                self.root.after(0, lambda: on_done(resp, result))
+            except Exception as e:
+                self.root.after(0, lambda: on_error(e))
 
-            # Show raw JSON
+        def on_done(resp, result):
+
+            self.fetch_preview_btn.configure(state="normal")
+
             self.preview_raw.insert(
                 tk.END,
                 f"GET {url}?{('&'.join(f'{k}={v}' for k, v in params.items()))}\n"
@@ -1202,7 +1298,6 @@ class GeofenceCreatorGUI:
                 f"{json.dumps(result, indent=2) if isinstance(result, (dict, list)) else result}",
             )
 
-            # Parse rows into table
             rows = []
             if isinstance(result, dict):
                 rows = result.get("rows", [])
@@ -1212,25 +1307,6 @@ class GeofenceCreatorGUI:
             self.preview_count_label.set(f"{len(rows)} geofences found  |  Status: {resp.status_code}")
 
             for gf in rows:
-                rules_summary = []
-                for r in gf.get("rules", []):
-                    action = r.get("action", "")
-                    target = r.get("target", "")
-                    applies = r.get("appliesTo", [])
-                    extra = ""
-                    if applies:
-                        extra = f" ({','.join(applies)})"
-                    if r.get("farAwayDistanceInKm"):
-                        extra = f" ({r['farAwayDistanceInKm']}km)"
-                    if r.get("fileType"):
-                        extra = f" ({r['fileType']})"
-                    if r.get("assetConfiguration"):
-                        cfg = r["assetConfiguration"]
-                        blur = cfg.get("blurConfig", {})
-                        if blur:
-                            extra = f" (blur:{blur.get('driverBlurMode', '')})"
-                    rules_summary.append(f"{action} {target}{extra}")
-
                 self.preview_tree.insert(
                     "",
                     tk.END,
@@ -1240,13 +1316,17 @@ class GeofenceCreatorGUI:
                         gf.get("polygonId", ""),
                         gf.get("propertyId", ""),
                         gf.get("status", ""),
-                        " | ".join(rules_summary),
+                        self._summarize_rules(gf.get("rules", [])),
                     ),
                 )
 
-        except Exception as e:
+        def on_error(e):
+
+            self.fetch_preview_btn.configure(state="normal")
             self.preview_count_label.set("Error!")
             self.preview_raw.insert(tk.END, f"ERROR: {e}")
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _preview_tree_right_click(self, event):
         item = self.preview_tree.identify_row(event.y)
@@ -1325,14 +1405,38 @@ class GeofenceCreatorGUI:
             row=0, column=3, padx=5, pady=3, sticky="w"
         )
 
-        ttk.Button(top, text="Fetch Activities", command=self._fetch_activities).grid(
-            row=1, column=0, columnspan=2, pady=(8, 0), sticky="w"
-        )
+        self.fetch_activity_btn = ttk.Button(top, text="Fetch Activities", command=self._fetch_activities)
+        self.fetch_activity_btn.grid(row=1, column=0, columnspan=2, pady=(8, 0), sticky="w")
 
         self.activity_count_label = tk.StringVar(value="")
         ttk.Label(top, textvariable=self.activity_count_label, foreground="blue").grid(
             row=1, column=2, columnspan=4, pady=(8, 0), sticky="w"
         )
+
+        # --- Filters ---
+        filter_frame = ttk.LabelFrame(parent, text="Filters (applied locally after fetch)", padding=5)
+        filter_frame.pack(fill=tk.X, padx=10, pady=(0, 2))
+
+        ttk.Label(filter_frame, text="Activity Type:").pack(side=tk.LEFT, padx=(0, 4))
+        self.activity_filter_type = tk.StringVar(value="All")
+        self.activity_type_combo = ttk.Combobox(
+            filter_frame, textvariable=self.activity_filter_type,
+            values=["All"], width=18, state="readonly",
+        )
+        self.activity_type_combo.pack(side=tk.LEFT, padx=(0, 10))
+
+        ttk.Label(filter_frame, text="Geofence Name:").pack(side=tk.LEFT, padx=(0, 4))
+        self.activity_filter_name = tk.StringVar(value="")
+        ttk.Entry(filter_frame, textvariable=self.activity_filter_name, width=25).pack(side=tk.LEFT, padx=(0, 10))
+
+        ttk.Button(filter_frame, text="Apply Filter", command=self._apply_activity_filter).pack(side=tk.LEFT, padx=4)
+        ttk.Button(filter_frame, text="Clear", command=self._clear_activity_filter).pack(side=tk.LEFT, padx=4)
+
+        self.activity_filter_count = tk.StringVar(value="")
+        ttk.Label(filter_frame, textvariable=self.activity_filter_count, foreground="gray").pack(side=tk.LEFT, padx=8)
+
+        # Store fetched activity row data for filtering
+        self._activity_rows = []
 
         # --- Resizable pane: treeview (top) | raw JSON (bottom) ---
         pane = ttk.PanedWindow(parent, orient=tk.VERTICAL)
@@ -1343,13 +1447,14 @@ class GeofenceCreatorGUI:
         pane.add(tree_frame, weight=3)
 
         columns = (
-            "timestampUTC", "geofenceActivity", "geofenceName",
+            "timestampUTC", "localTime", "geofenceActivity", "geofenceName",
             "geofenceId", "propertyId", "assetId", "driverId",
         )
         self.activity_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=15)
 
         col_widths = {
             "timestampUTC": 170,
+            "localTime": 170,
             "geofenceActivity": 130,
             "geofenceName": 200,
             "geofenceId": 80,
@@ -1360,6 +1465,7 @@ class GeofenceCreatorGUI:
         for col in columns:
             self.activity_tree.heading(col, text=col)
             self.activity_tree.column(col, width=col_widths.get(col, 100), minwidth=50)
+        self._make_sortable(self.activity_tree, columns)
 
         vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.activity_tree.yview)
         hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.activity_tree.xview)
@@ -1390,6 +1496,59 @@ class GeofenceCreatorGUI:
         self.activity_raw = scrolledtext.ScrolledText(raw_frame, height=8, font=("Consolas", 9))
         self.activity_raw.pack(fill=tk.BOTH, expand=True)
 
+    def _parse_activity_row(self, act):
+        asset_id = act.get("assetId", "")
+        driver_id = act.get("driverId", "")
+        user_info = act.get("userInfo")
+        if user_info and not asset_id:
+            asset_id = f"user:{user_info.get('loginId', '')}"
+            driver_id = user_info.get("email", "")
+
+        utc_str = act.get("timestampUTC", "")
+        local_time_str = ""
+        if utc_str:
+            try:
+                utc_dt = datetime.fromisoformat(utc_str.replace("Z", "+00:00"))
+                local_dt = utc_dt.astimezone()
+                local_time_str = local_dt.strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                local_time_str = ""
+
+        return (
+            utc_str, local_time_str,
+            act.get("geofenceActivity", ""), act.get("geofenceName", ""),
+            act.get("geofenceId", ""), act.get("propertyId", ""),
+            asset_id, driver_id,
+        )
+
+    def _populate_activity_tree(self, row_tuples):
+        for item in self.activity_tree.get_children():
+            self.activity_tree.delete(item)
+        for vals in row_tuples:
+            self.activity_tree.insert("", tk.END, values=vals)
+
+    def _apply_activity_filter(self):
+        type_filter = self.activity_filter_type.get()
+        name_filter = self.activity_filter_name.get().strip().lower()
+
+        filtered = []
+        for vals in self._activity_rows:
+            # vals[2] = geofenceActivity, vals[3] = geofenceName
+            if type_filter != "All" and vals[2] != type_filter:
+                continue
+            if name_filter and name_filter not in str(vals[3]).lower():
+                continue
+            filtered.append(vals)
+
+        self._populate_activity_tree(filtered)
+        self.activity_filter_count.set(f"Showing {len(filtered)} of {len(self._activity_rows)}")
+
+    def _clear_activity_filter(self):
+        self.activity_filter_type.set("All")
+        self.activity_filter_name.set("")
+        self.activity_filter_count.set("")
+        self._populate_activity_tree(self._activity_rows)
+
     def _fetch_activities(self):
         base = self.base_url.get().rstrip("/")
         fleet = self.fleet_id.get()
@@ -1410,15 +1569,24 @@ class GeofenceCreatorGUI:
             self.activity_tree.delete(item)
         self.activity_raw.delete("1.0", tk.END)
         self.activity_count_label.set("Fetching...")
+        self.fetch_activity_btn.configure(state="disabled")
 
-        try:
-            resp = requests.get(url, params=params, auth=auth, timeout=30)
+
+        def worker():
             try:
-                result = resp.json()
-            except Exception:
-                result = resp.text
+                resp = requests.get(url, params=params, auth=auth, timeout=30)
+                try:
+                    result = resp.json()
+                except Exception:
+                    result = resp.text
+                self.root.after(0, lambda: on_done(resp, result))
+            except Exception as e:
+                self.root.after(0, lambda: on_error(e))
 
-            # Show raw JSON
+        def on_done(resp, result):
+
+            self.fetch_activity_btn.configure(state="normal")
+
             self.activity_raw.insert(
                 tk.END,
                 f"GET {url}?{('&'.join(f'{k}={v}' for k, v in params.items()))}\n"
@@ -1426,7 +1594,6 @@ class GeofenceCreatorGUI:
                 f"{json.dumps(result, indent=2) if isinstance(result, (dict, list)) else result}",
             )
 
-            # Parse rows into table
             rows = []
             total_count = ""
             if isinstance(result, dict):
@@ -1441,32 +1608,24 @@ class GeofenceCreatorGUI:
             info += f"  |  Status: {resp.status_code}"
             self.activity_count_label.set(info)
 
-            for act in rows:
-                # For GeofenceUpdate type, show userInfo instead of assetId/driverId
-                asset_id = act.get("assetId", "")
-                driver_id = act.get("driverId", "")
-                user_info = act.get("userInfo")
-                if user_info and not asset_id:
-                    asset_id = f"user:{user_info.get('loginId', '')}"
-                    driver_id = user_info.get("email", "")
+            # Parse and store rows for filtering
+            self._activity_rows = [self._parse_activity_row(act) for act in rows]
+            self._populate_activity_tree(self._activity_rows)
 
-                self.activity_tree.insert(
-                    "",
-                    tk.END,
-                    values=(
-                        act.get("timestampUTC", ""),
-                        act.get("geofenceActivity", ""),
-                        act.get("geofenceName", ""),
-                        act.get("geofenceId", ""),
-                        act.get("propertyId", ""),
-                        asset_id,
-                        driver_id,
-                    ),
-                )
+            # Update filter combo with unique activity types
+            types = sorted(set(v[2] for v in self._activity_rows if v[2]))
+            self.activity_type_combo["values"] = ["All"] + types
+            self.activity_filter_type.set("All")
+            self.activity_filter_name.set("")
+            self.activity_filter_count.set("")
 
-        except Exception as e:
+        def on_error(e):
+
+            self.fetch_activity_btn.configure(state="normal")
             self.activity_count_label.set("Error!")
             self.activity_raw.insert(tk.END, f"ERROR: {e}")
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # ================================================================
     # SHARED: Search in ScrolledText widget
@@ -1597,7 +1756,7 @@ class GeofenceCreatorGUI:
             base = self.base_url.get().rstrip("/")
             fleet = self.fleet_id.get()
             auth = HTTPBasicAuth(self.username.get(), self.password.get())
-            max_workers = int(self.map_workers.get() or 30)
+            max_workers = self._safe_int(self.map_workers.get(), 30)
 
             # Step 1: fetch device geofences
             url = f"{base}/v2/fleets/{fleet}/geofences/devices/{device_id}"
