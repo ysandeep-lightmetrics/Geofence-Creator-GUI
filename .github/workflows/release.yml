@@ -37,13 +37,9 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller requests
+          pip install pyinstaller requests python-dotenv
 
       - name: Build with PyInstaller
-        env:
-          LMPRESALES_PWD: ${{ secrets.LMPRESALES_PWD }}
-          LMQATESTING1_PWD: ${{ secrets.LMQATESTING1_PWD }}
-          LMQATESTING2_PWD: ${{ secrets.LMQATESTING2_PWD }}
         run: pyinstaller --onefile --windowed --name GeofenceCreator geofence_creator_gui.py
 
       - name: Rename artifact (non-Windows)
