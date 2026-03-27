@@ -7,10 +7,11 @@ import threading
 import concurrent.futures
 import tempfile
 import os
+import sys
+import traceback
 from dotenv import load_dotenv
 import requests
-from datetime import datetime
-from requests.auth import HTTPBasicAuth
+from datetime import datetime, timedelta
 
 
 # ---------------------------------------------------------------------------
@@ -87,11 +88,72 @@ ENVIRONMENTS = {
     "Beta": "https://api-beta.lightmetrics.co",
 }
 
-AUTH_USERS = {
-    "lmpresales": os.environ.get("LMPRESALES_PWD", ""),
-    "lmqatesting1": os.environ.get("LMQATESTING1_PWD", ""),
-    "lmqatesting2": os.environ.get("LMQATESTING2_PWD", ""),
-}
+OAUTH2_ACCOUNTS = ["lmpresales", "lmqatesting1", "lmqatesting2"]
+OAUTH2_OTHER_USERNAME = os.environ.get("OAUTH2_OTHER_USERNAME", "")
+OAUTH2_OTHER_PASSWORD = os.environ.get("OAUTH2_OTHER_PASSWORD", "")
+
+
+# ---------------------------------------------------------------------------
+# OAuth2 token manager
+# ---------------------------------------------------------------------------
+class AuthManager:
+    def __init__(self):
+        self._id_token = None
+        self._access_token = None
+        self._refresh_token = None
+        self._expires_at = None
+
+    def authenticate(self, base_url, username, password):
+        url = f"{base_url}/v1/auth/oauth2/token"
+        resp = requests.post(url, json={
+            "grant_type": "password",
+            "username": username,
+            "password": password,
+        }, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        self._id_token = data["id_token"]
+        self._access_token = data["access_token"]
+        self._refresh_token = data.get("refresh_token")
+        expires_in = data.get("expires_in", 86400)
+        self._expires_at = datetime.now() + timedelta(seconds=expires_in - 60)
+        return data
+
+    def refresh(self, base_url):
+        if not self._refresh_token:
+            raise RuntimeError("No refresh token available.")
+        url = f"{base_url}/v1/auth/oauth2/token"
+        resp = requests.post(url, json={
+            "grant_type": "refresh_token",
+            "refresh_token": self._refresh_token,
+        }, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        self._id_token = data["id_token"]
+        self._access_token = data["access_token"]
+        if data.get("refresh_token"):
+            self._refresh_token = data["refresh_token"]
+        expires_in = data.get("expires_in", 86400)
+        self._expires_at = datetime.now() + timedelta(seconds=expires_in - 60)
+        return data
+
+    def is_valid(self):
+        return (
+            self._id_token is not None
+            and self._expires_at is not None
+            and datetime.now() < self._expires_at
+        )
+
+    def expires_at_str(self):
+        if self._expires_at is None:
+            return ""
+        return self._expires_at.strftime("%Y-%m-%d %H:%M")
+
+    def logout(self):
+        self._id_token = None
+        self._access_token = None
+        self._refresh_token = None
+        self._expires_at = None
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +167,7 @@ class GeofenceCreatorGUI:
         self.root.minsize(800, 600)
 
         self.stored_property_id = tk.StringVar(value="")
+        self._auth_manager = AuthManager()
 
         style = ttk.Style()
         style.configure("Header.TLabel", font=("Segoe UI", 11, "bold"))
@@ -141,6 +204,18 @@ class GeofenceCreatorGUI:
         notebook.add(map_tab, text="  Map Preview  ")
         self._build_map_tab(map_tab)
 
+        logs_tab = ttk.Frame(notebook)
+        notebook.add(logs_tab, text="  Logs  ")
+        self._build_logs_tab(logs_tab)
+
+        # Catch unhandled exceptions and route them to the log
+        def _excepthook(exc_type, exc_value, exc_tb):
+            msg = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+            self._log(msg, level="CRITICAL")
+        sys.excepthook = _excepthook
+
+        self._log("App started")
+
     # ================================================================
     # CONFIG TAB
     # ================================================================
@@ -172,42 +247,45 @@ class GeofenceCreatorGUI:
             row=1, column=1, columnspan=2, padx=10, pady=5, sticky="w"
         )
 
-        # ---- Auth ----
+        # ---- Auth (OAuth2 only) ----
         auth_frame = ttk.LabelFrame(parent, text="Authentication", padding=15)
         auth_frame.pack(fill=tk.X, padx=20, pady=(0, 10))
 
-        self.auth_user = tk.StringVar(value=list(AUTH_USERS.keys())[0])
-        self.username = tk.StringVar(value=list(AUTH_USERS.keys())[0])
-        self.password = tk.StringVar(value=list(AUTH_USERS.values())[0])
+        self.auth_user = tk.StringVar(value=OAUTH2_ACCOUNTS[0])
 
-        ttk.Label(auth_frame, text="Select User:").grid(row=0, column=0, sticky="w", pady=5)
-        user_combo = ttk.Combobox(
+        ttk.Label(auth_frame, text="Username:").grid(row=0, column=0, sticky="w", pady=4)
+        self.oauth2_user_entry = ttk.Entry(auth_frame, width=32)
+        self.oauth2_user_entry.insert(0, OAUTH2_OTHER_USERNAME)
+        self.oauth2_user_entry.grid(row=0, column=1, padx=10, pady=4, sticky="w")
+
+        ttk.Label(auth_frame, text="Password:").grid(row=1, column=0, sticky="w", pady=4)
+        self.oauth2_pwd_entry = ttk.Entry(auth_frame, width=32, show="*")
+        self.oauth2_pwd_entry.insert(0, OAUTH2_OTHER_PASSWORD)
+        self.oauth2_pwd_entry.grid(row=1, column=1, padx=10, pady=4, sticky="w")
+        ttk.Button(auth_frame, text="Save to .env",
+                   command=self._save_oauth2_creds).grid(row=1, column=2, padx=5, pady=4, sticky="w")
+
+        ttk.Label(auth_frame, text="Account:").grid(row=2, column=0, sticky="w", pady=4)
+        oauth2_acct_combo = ttk.Combobox(
             auth_frame,
             textvariable=self.auth_user,
-            values=list(AUTH_USERS.keys()) + ["Other"],
+            values=OAUTH2_ACCOUNTS + ["Other"],
             width=25,
             state="readonly",
         )
-        user_combo.grid(row=0, column=1, padx=10, pady=5, sticky="w")
-        user_combo.bind("<<ComboboxSelected>>", self._on_user_change)
+        oauth2_acct_combo.grid(row=2, column=1, padx=10, pady=4, sticky="w")
+        oauth2_acct_combo.bind("<<ComboboxSelected>>", self._on_oauth2_account_change)
 
-        self.pwd_display = tk.StringVar(value="*" * 20)
-        self.pwd_display_label = ttk.Label(auth_frame, textvariable=self.pwd_display, foreground="gray")
-        ttk.Label(auth_frame, text="Password:").grid(row=1, column=0, sticky="w", pady=5)
-        self.pwd_display_label.grid(row=1, column=1, padx=10, pady=5, sticky="w")
+        self.oauth2_custom_account_entry = ttk.Entry(auth_frame, width=28)
+        # hidden by default, shown when "Other" is selected
 
-        # Custom auth fields (hidden by default, shown when "Other" is selected)
-        self.custom_auth_frame = ttk.Frame(auth_frame)
-        ttk.Label(self.custom_auth_frame, text="Username:").grid(row=0, column=0, sticky="w", pady=5)
-        self.custom_username_entry = ttk.Entry(self.custom_auth_frame, width=30)
-        self.custom_username_entry.grid(row=0, column=1, padx=10, pady=5, sticky="w")
-        ttk.Label(self.custom_auth_frame, text="Password:").grid(row=1, column=0, sticky="w", pady=5)
-        self.custom_password_entry = ttk.Entry(self.custom_auth_frame, width=30, show="*")
-        self.custom_password_entry.grid(row=1, column=1, padx=10, pady=5, sticky="w")
-        self.custom_set_btn = ttk.Button(
-            self.custom_auth_frame, text="Set", width=8, command=self._on_custom_auth_set
-        )
-        self.custom_set_btn.grid(row=2, column=1, padx=10, pady=5, sticky="w")
+        btn_row = ttk.Frame(auth_frame)
+        btn_row.grid(row=3, column=0, columnspan=3, sticky="w", pady=5)
+        self.oauth2_login_btn = ttk.Button(btn_row, text="Login", command=self._do_oauth2_login)
+        self.oauth2_login_btn.pack(side=tk.LEFT)
+        ttk.Button(btn_row, text="Logout", command=self._do_oauth2_logout).pack(side=tk.LEFT, padx=(8, 0))
+        self.oauth2_status_var = tk.StringVar(value="Not authenticated")
+        ttk.Label(btn_row, textvariable=self.oauth2_status_var, foreground="gray").pack(side=tk.LEFT, padx=12)
 
         # ---- Summary ----
         summary = ttk.LabelFrame(parent, text="Current Config Summary", padding=15)
@@ -244,34 +322,121 @@ class GeofenceCreatorGUI:
         url = ENVIRONMENTS.get(env, "")
         self.base_url.set(url)
         self.url_label.config(text=url)
+        # Token is env-specific — clear it when env changes
+        self._auth_manager.logout()
+        self.oauth2_status_var.set("Not authenticated (env changed — please re-login)")
         self._update_summary()
 
-    def _on_user_change(self, _event=None):
-        user = self.auth_user.get()
-        if user == "Other":
-            # Show custom input fields, hide password display
-            self.pwd_display_label.grid_remove()
-            self.custom_auth_frame.grid(row=2, column=0, columnspan=2, sticky="w", pady=5)
+    def _do_oauth2_login(self):
+        uname = self.oauth2_user_entry.get().strip()
+        pwd = self.oauth2_pwd_entry.get().strip()
+        if not uname or not pwd:
+            messagebox.showerror("OAuth2 Error", "Enter username and password.")
+            return
+        self.oauth2_login_btn.configure(state="disabled")
+        self.oauth2_status_var.set("Authenticating...")
+        base = self.base_url.get().rstrip("/")
+
+        self._log(f"OAuth2 login attempt → {base}  user={uname}")
+
+        def worker():
+            try:
+                self._auth_manager.authenticate(base, uname, pwd)
+                self.root.after(0, on_done)
+            except Exception as e:
+                self.root.after(0, lambda e=e: on_error(e))
+
+        def on_done():
+            self.oauth2_login_btn.configure(state="normal")
+            self.oauth2_status_var.set(f"Authenticated  (expires {self._auth_manager.expires_at_str()})")
+            self._log(f"OAuth2 login OK — expires {self._auth_manager.expires_at_str()}")
+            self._update_summary()
+
+        def on_error(e):
+            self.oauth2_login_btn.configure(state="normal")
+            self.oauth2_status_var.set("Login failed")
+            self._log(f"OAuth2 login FAILED: {e}", level="ERROR")
+            messagebox.showerror("OAuth2 Login Failed", str(e))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_oauth2_account_change(self, _event=None):
+        if self.auth_user.get() == "Other":
+            self.oauth2_custom_account_entry.grid(row=2, column=2, padx=(0, 5), pady=4, sticky="w")
+            self.oauth2_custom_account_entry.focus()
+            self.oauth2_custom_account_entry.bind("<FocusOut>", self._on_oauth2_custom_account_set)
+            self.oauth2_custom_account_entry.bind("<Return>", self._on_oauth2_custom_account_set)
         else:
-            # Hide custom fields, show password display
-            self.custom_auth_frame.grid_remove()
-            self.pwd_display_label.grid()
-            pwd = AUTH_USERS.get(user, "")
-            self.username.set(user)
-            self.password.set(pwd)
-            self.pwd_display.set(pwd[:4] + "*" * 16)
+            self.oauth2_custom_account_entry.grid_remove()
+            self._update_summary()
+
+    def _on_oauth2_custom_account_set(self, _event=None):
+        val = self.oauth2_custom_account_entry.get().strip()
+        if val:
+            self.auth_user.set(val)
         self._update_summary()
 
-    def _on_custom_auth_set(self):
-        self.username.set(self.custom_username_entry.get())
-        self.password.set(self.custom_password_entry.get())
+    def _do_oauth2_logout(self):
+        self._auth_manager.logout()
+        self.oauth2_status_var.set("Not authenticated")
+        self._log("OAuth2 logged out")
         self._update_summary()
-        messagebox.showinfo("Auth Set", f"Credentials set for user: {self.username.get()}")
+
+    def _save_oauth2_creds(self):
+        uname = self.oauth2_user_entry.get().strip()
+        pwd = self.oauth2_pwd_entry.get().strip()
+        if not uname or not pwd:
+            messagebox.showerror("Error", "Username and Password cannot be empty.")
+            return
+        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", ".env")
+        try:
+            with open(env_path, "r") as f:
+                lines = f.readlines()
+            new_lines = []
+            found_user = found_pwd = False
+            for line in lines:
+                if line.startswith("OAUTH2_OTHER_USERNAME="):
+                    new_lines.append(f"OAUTH2_OTHER_USERNAME={uname}\n")
+                    found_user = True
+                elif line.startswith("OAUTH2_OTHER_PASSWORD="):
+                    new_lines.append(f"OAUTH2_OTHER_PASSWORD={pwd}\n")
+                    found_pwd = True
+                else:
+                    new_lines.append(line)
+            if not found_user:
+                new_lines.append(f"OAUTH2_OTHER_USERNAME={uname}\n")
+            if not found_pwd:
+                new_lines.append(f"OAUTH2_OTHER_PASSWORD={pwd}\n")
+            with open(env_path, "w") as f:
+                f.writelines(new_lines)
+            messagebox.showinfo("Saved", "OAuth2 credentials saved to config/.env")
+        except Exception as e:
+            messagebox.showerror("Save Failed", str(e))
+
+    def _get_request_kwargs(self):
+        """Returns auth kwargs to unpack into any requests call."""
+        if not self._auth_manager.is_valid():
+            if self._auth_manager._refresh_token:
+                self._log("OAuth2 token expired — refreshing...", level="WARN")
+                self._auth_manager.refresh(self.base_url.get().rstrip("/"))
+                self._log("OAuth2 token refreshed OK")
+            else:
+                self._log("OAuth2 not authenticated — request blocked", level="ERROR")
+                raise RuntimeError("Not authenticated. Please click Login in the Config tab.")
+        return {"headers": {
+            "id-token": self._auth_manager._id_token,
+            "Authorization": f"Bearer {self._auth_manager._access_token}",
+            "x-lm-desired-account": self.auth_user.get(),
+        }}
 
     def _update_summary(self):
+        if self._auth_manager.is_valid():
+            auth_info = f"OAuth2 ({self.auth_user.get()})  valid until {self._auth_manager.expires_at_str()}"
+        else:
+            auth_info = f"OAuth2 ({self.auth_user.get()})  NOT authenticated"
         self.summary_text.set(
             f"ENV: {self.env_name.get()}  |  URL: {self.base_url.get()}  |  "
-            f"Fleet: {self.fleet_id.get()}  |  User: {self.username.get()}"
+            f"Fleet: {self.fleet_id.get()}  |  Auth: {auth_info}"
         )
 
     # ================================================================
@@ -715,28 +880,33 @@ class GeofenceCreatorGUI:
             return
 
         url = f"{self.base_url.get().rstrip('/')}/v2/fleets/{self.fleet_id.get()}/geofences/properties"
-        auth = HTTPBasicAuth(self.username.get(), self.password.get())
-        headers = {"Content-Type": "application/json"}
 
         self.prop_resp.delete("1.0", tk.END)
         self.prop_resp.insert(tk.END, f"POST {url}\n\n")
         self.create_prop_btn.configure(state="disabled")
 
+        try:
+            req_kwargs = self._get_request_kwargs()
+        except RuntimeError as e:
+            messagebox.showerror("Auth Error", str(e))
+            self.create_prop_btn.configure(state="normal")
+            return
 
         def worker():
             try:
-                resp = requests.post(url, headers=headers, auth=auth, json=payload, timeout=30)
+                resp = requests.post(url, json=payload, **req_kwargs, timeout=30)
                 try:
                     result = resp.json()
                 except Exception:
                     result = resp.text
                 self.root.after(0, lambda: on_done(resp, result))
             except Exception as e:
-                self.root.after(0, lambda: on_error(e))
+                self.root.after(0, lambda e=e: on_error(e))
 
         def on_done(resp, result):
-
             self.create_prop_btn.configure(state="normal")
+            level = "INFO" if resp.status_code < 400 else "ERROR"
+            self._log(f"POST {url} → {resp.status_code}", level=level)
             self.prop_resp.insert(
                 tk.END,
                 f"Status: {resp.status_code}\n\n{json.dumps(result, indent=2) if isinstance(result, dict) else result}\n",
@@ -750,8 +920,8 @@ class GeofenceCreatorGUI:
                 )
 
         def on_error(e):
-
             self.create_prop_btn.configure(state="normal")
+            self._log(f"POST {url} → ERROR: {e}", level="ERROR")
             self.prop_resp.insert(tk.END, f"ERROR: {e}")
 
         threading.Thread(target=worker, daemon=True).start()
@@ -889,36 +1059,41 @@ class GeofenceCreatorGUI:
             return
 
         url = f"{self.base_url.get().rstrip('/')}/v2/fleets/{self.fleet_id.get()}/geofences"
-        auth = HTTPBasicAuth(self.username.get(), self.password.get())
-        headers = {"Content-Type": "application/json"}
 
         self.geo_resp.delete("1.0", tk.END)
         self.geo_resp.insert(tk.END, f"POST {url}\n\n")
         self.create_geo_btn.configure(state="disabled")
 
+        try:
+            req_kwargs = self._get_request_kwargs()
+        except RuntimeError as e:
+            messagebox.showerror("Auth Error", str(e))
+            self.create_geo_btn.configure(state="normal")
+            return
 
         def worker():
             try:
-                resp = requests.post(url, headers=headers, auth=auth, json=payload, timeout=30)
+                resp = requests.post(url, json=payload, **req_kwargs, timeout=30)
                 try:
                     result = resp.json()
                 except Exception:
                     result = resp.text
                 self.root.after(0, lambda: on_done(resp, result))
             except Exception as e:
-                self.root.after(0, lambda: on_error(e))
+                self.root.after(0, lambda e=e: on_error(e))
 
         def on_done(resp, result):
-
             self.create_geo_btn.configure(state="normal")
+            level = "INFO" if resp.status_code < 400 else "ERROR"
+            self._log(f"POST {url} → {resp.status_code}", level=level)
             self.geo_resp.insert(
                 tk.END,
                 f"Status: {resp.status_code}\n\n{json.dumps(result, indent=2) if isinstance(result, dict) else result}",
             )
 
         def on_error(e):
-
             self.create_geo_btn.configure(state="normal")
+            self._log(f"POST {url} → ERROR: {e}", level="ERROR")
             self.geo_resp.insert(tk.END, f"ERROR: {e}")
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1033,7 +1208,6 @@ class GeofenceCreatorGUI:
         base = self.base_url.get().rstrip("/")
         fleet = self.fleet_id.get()
         url = f"{base}/v2/fleets/{fleet}/geofences/properties"
-        auth = HTTPBasicAuth(self.username.get(), self.password.get())
 
         for item in self.props_tree.get_children():
             self.props_tree.delete(item)
@@ -1041,17 +1215,23 @@ class GeofenceCreatorGUI:
         self.props_count_label.set("Fetching...")
         self.fetch_props_btn.configure(state="disabled")
 
+        try:
+            req_kwargs = self._get_request_kwargs()
+        except RuntimeError as e:
+            messagebox.showerror("Auth Error", str(e))
+            self.fetch_props_btn.configure(state="normal")
+            return
 
         def worker():
             try:
-                resp = requests.get(url, auth=auth, timeout=30)
+                resp = requests.get(url, **req_kwargs, timeout=30)
                 try:
                     result = resp.json()
                 except Exception:
                     result = resp.text
                 self.root.after(0, lambda: on_done(resp, result))
             except Exception as e:
-                self.root.after(0, lambda: on_error(e))
+                self.root.after(0, lambda e=e: on_error(e))
 
         def on_done(resp, result):
 
@@ -1089,9 +1269,9 @@ class GeofenceCreatorGUI:
                 )
 
         def on_error(e):
-
             self.fetch_props_btn.configure(state="normal")
             self.props_count_label.set("Error!")
+            self._log(f"GET {url} → ERROR: {e}", level="ERROR")
             self.props_raw.insert(tk.END, f"ERROR: {e}")
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1133,11 +1313,12 @@ class GeofenceCreatorGUI:
         base = self.base_url.get().rstrip("/")
         fleet = self.fleet_id.get()
         url = f"{base}/v2/fleets/{fleet}/geofences/properties/{property_id}"
-        auth = HTTPBasicAuth(self.username.get(), self.password.get())
 
         try:
-            resp = requests.delete(url, auth=auth, timeout=30)
+            req_kwargs = self._get_request_kwargs()
+            resp = requests.delete(url, **req_kwargs, timeout=30)
             if resp.status_code in (200, 204):
+                self._log(f"DELETE {url} → {resp.status_code} (property deleted)")
                 messagebox.showinfo("Deleted", f"Property {property_id} deleted successfully.")
                 self._fetch_properties()
             else:
@@ -1145,8 +1326,10 @@ class GeofenceCreatorGUI:
                     body = json.dumps(resp.json(), indent=2)
                 except Exception:
                     body = resp.text
+                self._log(f"DELETE {url} → {resp.status_code}\n{body}", level="ERROR")
                 messagebox.showerror("Delete Failed", f"Status: {resp.status_code}\n\n{body}")
         except Exception as e:
+            self._log(f"DELETE {url} → ERROR: {e}", level="ERROR")
             messagebox.showerror("Error", f"Request failed:\n{e}")
 
     # ================================================================
@@ -1266,8 +1449,6 @@ class GeofenceCreatorGUI:
         if status:
             params["status"] = status
 
-        auth = HTTPBasicAuth(self.username.get(), self.password.get())
-
         # Clear previous
         for item in self.preview_tree.get_children():
             self.preview_tree.delete(item)
@@ -1275,17 +1456,23 @@ class GeofenceCreatorGUI:
         self.preview_count_label.set("Fetching...")
         self.fetch_preview_btn.configure(state="disabled")
 
+        try:
+            req_kwargs = self._get_request_kwargs()
+        except RuntimeError as e:
+            messagebox.showerror("Auth Error", str(e))
+            self.fetch_preview_btn.configure(state="normal")
+            return
 
         def worker():
             try:
-                resp = requests.get(url, params=params, auth=auth, timeout=30)
+                resp = requests.get(url, params=params, **req_kwargs, timeout=30)
                 try:
                     result = resp.json()
                 except Exception:
                     result = resp.text
                 self.root.after(0, lambda: on_done(resp, result))
             except Exception as e:
-                self.root.after(0, lambda: on_error(e))
+                self.root.after(0, lambda e=e: on_error(e))
 
         def on_done(resp, result):
 
@@ -1321,9 +1508,9 @@ class GeofenceCreatorGUI:
                 )
 
         def on_error(e):
-
             self.fetch_preview_btn.configure(state="normal")
             self.preview_count_label.set("Error!")
+            self._log(f"GET {url} → ERROR: {e}", level="ERROR")
             self.preview_raw.insert(tk.END, f"ERROR: {e}")
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1365,11 +1552,12 @@ class GeofenceCreatorGUI:
         base = self.base_url.get().rstrip("/")
         fleet = self.fleet_id.get()
         url = f"{base}/v2/fleets/{fleet}/geofences/properties/{property_id}"
-        auth = HTTPBasicAuth(self.username.get(), self.password.get())
 
         try:
-            resp = requests.delete(url, auth=auth, timeout=30)
+            req_kwargs = self._get_request_kwargs()
+            resp = requests.delete(url, **req_kwargs, timeout=30)
             if resp.status_code in (200, 204):
+                self._log(f"DELETE {url} → {resp.status_code} (geofence property deleted)")
                 messagebox.showinfo("Deleted", f"Property {property_id} deleted successfully.")
                 # Refresh the list
                 self._fetch_device_geofences()
@@ -1378,11 +1566,13 @@ class GeofenceCreatorGUI:
                     body = json.dumps(resp.json(), indent=2)
                 except Exception:
                     body = resp.text
+                self._log(f"DELETE {url} → {resp.status_code}\n{body}", level="ERROR")
                 messagebox.showerror(
                     "Delete Failed",
                     f"Status: {resp.status_code}\n\n{body}",
                 )
         except Exception as e:
+            self._log(f"DELETE {url} → ERROR: {e}", level="ERROR")
             messagebox.showerror("Error", f"Request failed:\n{e}")
 
     # ================================================================
@@ -1562,8 +1752,6 @@ class GeofenceCreatorGUI:
         if limit:
             params["limit"] = limit
 
-        auth = HTTPBasicAuth(self.username.get(), self.password.get())
-
         # Clear previous
         for item in self.activity_tree.get_children():
             self.activity_tree.delete(item)
@@ -1571,22 +1759,28 @@ class GeofenceCreatorGUI:
         self.activity_count_label.set("Fetching...")
         self.fetch_activity_btn.configure(state="disabled")
 
+        try:
+            req_kwargs = self._get_request_kwargs()
+        except RuntimeError as e:
+            messagebox.showerror("Auth Error", str(e))
+            self.fetch_activity_btn.configure(state="normal")
+            return
 
         def worker():
             try:
-                resp = requests.get(url, params=params, auth=auth, timeout=30)
+                resp = requests.get(url, params=params, **req_kwargs, timeout=30)
                 try:
                     result = resp.json()
                 except Exception:
                     result = resp.text
                 self.root.after(0, lambda: on_done(resp, result))
             except Exception as e:
-                self.root.after(0, lambda: on_error(e))
+                self.root.after(0, lambda e=e: on_error(e))
 
         def on_done(resp, result):
-
             self.fetch_activity_btn.configure(state="normal")
-
+            level = "INFO" if resp.status_code < 400 else "ERROR"
+            self._log(f"GET {url} → {resp.status_code}", level=level)
             self.activity_raw.insert(
                 tk.END,
                 f"GET {url}?{('&'.join(f'{k}={v}' for k, v in params.items()))}\n"
@@ -1620,9 +1814,9 @@ class GeofenceCreatorGUI:
             self.activity_filter_count.set("")
 
         def on_error(e):
-
             self.fetch_activity_btn.configure(state="normal")
             self.activity_count_label.set("Error!")
+            self._log(f"GET {url} → ERROR: {e}", level="ERROR")
             self.activity_raw.insert(tk.END, f"ERROR: {e}")
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1697,6 +1891,75 @@ class GeofenceCreatorGUI:
         "#ffd8b1", "#000075", "#a9a9a9", "#e6beff", "#fffac8",
     ]
 
+    # ================================================================
+    # LOGS TAB
+    # ================================================================
+    def _build_logs_tab(self, parent):
+        top = ttk.Frame(parent)
+        top.pack(fill=tk.X, padx=10, pady=(8, 4))
+
+        ttk.Label(top, text="Debug log — all API calls, errors, and auth events", foreground="gray").pack(side=tk.LEFT)
+        ttk.Button(top, text="Copy All", command=self._logs_copy).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(top, text="Clear", command=self._logs_clear).pack(side=tk.RIGHT)
+
+        self._log_file_label = tk.StringVar(value="")
+        ttk.Label(parent, textvariable=self._log_file_label, foreground="gray",
+                  font=("Consolas", 8)).pack(anchor="w", padx=10)
+
+        self.logs_text = scrolledtext.ScrolledText(parent, font=("Consolas", 9), wrap=tk.WORD, state="disabled")
+        self.logs_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 8))
+        self.logs_text.tag_configure("ERROR",    foreground="#cc0000")
+        self.logs_text.tag_configure("CRITICAL", foreground="#cc0000", font=("Consolas", 9, "bold"))
+        self.logs_text.tag_configure("WARN",     foreground="#e67300")
+        self.logs_text.tag_configure("INFO",     foreground="#007700")
+        self.logs_text.tag_configure("DEBUG",    foreground="#555555")
+
+        # Set up log file path
+        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        self._log_path = os.path.join(log_dir, "debug.log")
+        self._log_file_label.set(f"Log file: {self._log_path}")
+
+    def _log(self, msg, level="INFO"):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{ts}] [{level}] {msg}"
+
+        # Print to terminal
+        out = sys.stderr if level in ("ERROR", "CRITICAL") else sys.stdout
+        print(line, file=out, flush=True)
+
+        line = line + "\n"
+
+        # Write to file
+        try:
+            with open(self._log_path, "a", encoding="utf-8") as f:
+                f.write(line)
+        except Exception:
+            pass
+
+        # Write to widget (thread-safe via after)
+        def _append():
+            self.logs_text.configure(state="normal")
+            self.logs_text.insert(tk.END, line, level)
+            self.logs_text.see(tk.END)
+            self.logs_text.configure(state="disabled")
+
+        if threading.current_thread() is threading.main_thread():
+            _append()
+        else:
+            self.root.after(0, _append)
+
+    def _logs_copy(self):
+        text = self.logs_text.get("1.0", tk.END).strip()
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        messagebox.showinfo("Copied", "Log contents copied to clipboard.")
+
+    def _logs_clear(self):
+        self.logs_text.configure(state="normal")
+        self.logs_text.delete("1.0", tk.END)
+        self.logs_text.configure(state="disabled")
+
     def _build_map_tab(self, parent):
         top = ttk.LabelFrame(parent, text="Visualize Device Geofences on Map", padding=10)
         top.pack(fill=tk.X, padx=10, pady=5)
@@ -1755,7 +2018,7 @@ class GeofenceCreatorGUI:
         try:
             base = self.base_url.get().rstrip("/")
             fleet = self.fleet_id.get()
-            auth = HTTPBasicAuth(self.username.get(), self.password.get())
+            req_kwargs = self._get_request_kwargs()
             max_workers = self._safe_int(self.map_workers.get(), 30)
 
             # Step 1: fetch device geofences
@@ -1766,7 +2029,7 @@ class GeofenceCreatorGUI:
                 params["status"] = status_filter
 
             self._map_log_append(f"[1/3] Fetching geofences...\n  GET {url}")
-            resp = requests.get(url, params=params, auth=auth, timeout=30)
+            resp = requests.get(url, params=params, **req_kwargs, timeout=30)
             resp.raise_for_status()
             geofences = resp.json().get("rows", [])
             self._map_log_append(f"  -> {len(geofences)} geofences found.")
@@ -1786,7 +2049,7 @@ class GeofenceCreatorGUI:
                     return pid, None
                 poly_url = f"{base}/v1/fleets/{fleet}/geofences/polygons/{pid}"
                 try:
-                    r = requests.get(poly_url, auth=auth, timeout=30)
+                    r = requests.get(poly_url, **req_kwargs, timeout=30)
                     r.raise_for_status()
                     raw = r.json()
                     inner = raw.get("rows", raw)
@@ -1826,6 +2089,7 @@ class GeofenceCreatorGUI:
 
         except Exception as e:
             self._map_log_append(f"\nERROR: {e}")
+            self._log(f"Map worker ERROR: {e}\n{traceback.format_exc()}", level="ERROR")
             self.root.after(0, lambda: self.map_status_label.set("Error!"))
 
     def _build_map_html(self, geofences, polygon_coords, fleet, device_id):

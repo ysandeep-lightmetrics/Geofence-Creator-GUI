@@ -19,9 +19,10 @@ jobs:
           - os: macos-latest
             artifact: GeofenceCreator-mac
             build_path: dist/GeofenceCreator
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             artifact: GeofenceCreator-linux
             build_path: dist/GeofenceCreator
+            python-version: "3.10"
 
     runs-on: ${{ matrix.os }}
 
@@ -31,7 +32,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version || '3.12' }}
 
       - name: Install dependencies
         run: |

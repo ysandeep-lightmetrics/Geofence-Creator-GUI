@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''geofence_creator_gui.py''\\).read\\(\\)\\); print\\(''Syntax OK''\\)\")"
+    ]
+  }
+}
