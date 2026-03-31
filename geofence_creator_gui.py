@@ -1409,7 +1409,7 @@ class GeofenceCreatorGUI:
 
         # Right-click context menu
         self.preview_ctx_menu = tk.Menu(self.preview_tree, tearoff=0)
-        self.preview_ctx_menu.add_command(label="Delete Geofence Property", command=self._delete_selected_geofence)
+        self.preview_ctx_menu.add_command(label="Delete Geofence", command=self._delete_selected_geofence)
         self.preview_tree.bind("<Button-3>", self._preview_tree_right_click)
 
         # -- Bottom pane: raw JSON response with search --
@@ -1538,12 +1538,11 @@ class GeofenceCreatorGUI:
             return
 
         confirm = messagebox.askquestion(
-            "Delete Geofence Property",
+            "Delete Geofence",
             f"Are you sure you want to delete?\n\n"
             f"Geofence: {gf_name}\n"
-            f"GeofenceId: {gf_id}\n"
-            f"PropertyId: {property_id}\n\n"
-            f"This will DELETE the property and all its geofences.",
+            f"GeofenceId: {gf_id}\n\n"
+            f"This will permanently DELETE this geofence.",
             icon="warning",
         )
         if confirm != "yes":
@@ -1551,14 +1550,14 @@ class GeofenceCreatorGUI:
 
         base = self.base_url.get().rstrip("/")
         fleet = self.fleet_id.get()
-        url = f"{base}/v2/fleets/{fleet}/geofences/properties/{property_id}"
+        url = f"{base}/v2/fleets/{fleet}/geofences/{gf_id}"
 
         try:
             req_kwargs = self._get_request_kwargs()
             resp = requests.delete(url, **req_kwargs, timeout=30)
             if resp.status_code in (200, 204):
-                self._log(f"DELETE {url} → {resp.status_code} (geofence property deleted)")
-                messagebox.showinfo("Deleted", f"Property {property_id} deleted successfully.")
+                self._log(f"DELETE {url} → {resp.status_code} (geofence deleted)")
+                messagebox.showinfo("Deleted", f"Geofence {gf_id} deleted successfully.")
                 # Refresh the list
                 self._fetch_device_geofences()
             else:
